@@ -37,8 +37,12 @@ MAX_TOKENS = 100
 class ModelType(Enum):
     QWEN = "qwen"
     OMNI = "omni"
+    OMNI_CLIENT = "omni_client"  # 新增：远程客户端模式
 
-MODEL_TYPE = ModelType.OMNI
+MODEL_TYPE = ModelType.OMNI_CLIENT
+
+# 服务器地址（OmniVLA API）
+SERVER_URL = "http://connect.cqa1.seetacloud.com:8000"
 
 TEMPERATURE = 1.0
 TOP_P = 1.0
@@ -167,13 +171,39 @@ def generate_launch_description():
                 'top_p': TOP_P,
                 'top_k': TOP_K,
                 "enable_thinking": ENABLE_THINKING,
-                
+
                 'model_path': MODEL_PATH,
                 'language_prompt': LANGUAGE_PROMPT,
                 'goal_lat': GOAL_LAT,
                 'goal_lon': GOAL_LON,
                 'goal_compass': GOAL_COMPASS,
                 'goal_image_path': GOAL_IMAGE_PATH
+            }],
+            arguments=['--ros-args', '--log-level', log_level],
+        )
+    elif MODEL_TYPE == ModelType.OMNI_CLIENT:
+        # 远程客户端模式
+        model_name = 'omnivla_client'
+        model_node = Node(
+            package='car',
+            executable=model_name,
+            name=model_name,
+            parameters=[{
+                'prompt_topic': PROMPT_TOPIC,
+                'pic_topic': PIC_TOPIC,
+                'process_pic_topic': PROCESS_PIC_TOPIC,
+                'commd_topic': COMMD_TOPIC,
+                'server_url': SERVER_URL,
+                'request_timeout': 30.0,
+                'compression_quality': COMPRESSION_QUALITY,
+                'img_width': IMG_WIDTH,
+                'img_height': IMG_HIGHT,
+                'metric_waypoint_spacing': 0.2,
+                'retry_count': 3,
+                'retry_delay': 0.5,
+                'goal_lat': 0.0,
+                'goal_lon': 0.0,
+                'goal_compass': 0.0,
             }],
             arguments=['--ros-args', '--log-level', log_level],
         )
