@@ -9,3 +9,5 @@ src/car/pic/
 tools/**
 OmniVLA.egg-info
 ros_OmniVLA.egg-info
+astra_camera
+astra_camera_msgs
