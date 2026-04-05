@@ -14,6 +14,7 @@ from geometry_msgs.msg import PoseArray
 from pydantic import BaseModel
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
@@ -33,6 +34,7 @@ class RecvPromptNode(Node):
         self.declare_parameter("prompt_topic", "/car/prompt")
         self.declare_parameter("image_topic", "/car/process_pic")
         self.declare_parameter("raw_image_topic", "/car/pic")
+        self.declare_parameter("camera_mode", "")
         self.declare_parameter("text_topic", "/car/model_text")
         self.declare_parameter("waypoint_topic", "/goal_point")
         self.declare_parameter("prompt_complete_topic", "/car/prompt_complete")  # 新增
@@ -43,6 +45,7 @@ class RecvPromptNode(Node):
         self.prompt_topic = self.get_parameter("prompt_topic").get_parameter_value().string_value
         self.image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
         self.raw_image_topic = self.get_parameter("raw_image_topic").get_parameter_value().string_value
+        self.camera_mode = self.get_parameter("camera_mode").get_parameter_value().string_value
         self.text_topic = self.get_parameter("text_topic").get_parameter_value().string_value
         self.waypoint_topic = self.get_parameter("waypoint_topic").get_parameter_value().string_value
         self.prompt_complete_topic = self.get_parameter("prompt_complete_topic").get_parameter_value().string_value  # 新增
@@ -59,9 +62,14 @@ class RecvPromptNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
 
+        camera_mode_norm = (self.camera_mode or "").strip().lower()
+        if camera_mode_norm == "camera_dual" and self.raw_image_topic == "/car/pic":
+            self.raw_image_topic = "/camera/color/image_raw"
+        raw_qos = qos_profile_sensor_data if camera_mode_norm == "camera_dual" else qos
+
         self.prompt_pub = self.create_publisher(String, self.prompt_topic, qos)
         self.create_subscription(Image, self.image_topic, self.on_image, qos)
-        self.create_subscription(Image, self.raw_image_topic, self.on_raw_image, qos)
+        self.create_subscription(Image, self.raw_image_topic, self.on_raw_image, raw_qos)
         self.create_subscription(String, self.text_topic, self.on_text, qos)
         self.create_subscription(PoseArray, self.waypoint_topic, self.on_waypoints, qos)
         self.create_subscription(String, self.prompt_complete_topic, self.on_prompt_complete, qos)
@@ -95,6 +103,9 @@ class RecvPromptNode(Node):
         self._start_http_server()
         self.get_logger().info(
             f"HTTP ready at http://{self.http_host}:{self.http_port}, prompt_topic={self.prompt_topic}, dispatch_mode={self._dispatch_mode}"
+        )
+        self.get_logger().info(
+            f"raw_image_topic={self.raw_image_topic}, camera_mode={camera_mode_norm}"
         )
 
     @staticmethod
@@ -145,6 +156,7 @@ class RecvPromptNode(Node):
                     "frame_id": self._latest_frame_id,
                     "image_jpeg_b64": self._latest_image_b64,
                     "raw_frame_id": self._latest_raw_frame_id,
+                    "raw_image_topic": self.raw_image_topic,
                     "raw_image_jpeg_b64": self._latest_raw_image_b64,
                     "waypoints": self._latest_waypoints,
                     "prompt_processing": self._current_prompt_processing,

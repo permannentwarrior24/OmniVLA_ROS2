@@ -167,22 +167,22 @@ class ImagePublisherNode(Node):
                 else:
                     self.get_logger().info(f'已发布完所有图片共{len(self.cv_images)}张，停止发布。')
                     self.timer.cancel()
-            elif self.mode == 'camera_signal':
-                if self.cap is None or not self.cap.isOpened():
-                    self.get_logger().warn('摄像头未打开，无法发布。', throttle_duration_sec=5)
-                    return
-                ret, frame = self.cap.read()
-                if not ret:
-                    self.get_logger().warn('读取摄像头帧失败。', throttle_duration_sec=5)
-                    return
-                self.publish_frame(frame, 'camera_frame')
-            elif self.mode == 'camera_dual':
-                if self.latest_camera_msg is None:
-                    self.get_logger().warn('尚未收到 /camera/color/image_raw', throttle_duration_sec=5)
-                    return
-                msg = self.latest_camera_msg
-                msg.header.stamp = self.get_clock().now().to_msg()
-                self.publisher_.publish(msg)
+        elif self.mode == 'camera_signal':
+            if self.cap is None or not self.cap.isOpened():
+                self.get_logger().warn('摄像头未打开，无法发布。', throttle_duration_sec=5)
+                return
+            ret, frame = self.cap.read()
+            if not ret:
+                self.get_logger().warn('读取摄像头帧失败。', throttle_duration_sec=5)
+                return
+            self.publish_frame(frame, 'camera_frame')
+        elif self.mode == 'camera_dual':
+            if self.latest_camera_msg is None:
+                self.get_logger().warn('尚未收到 /camera/color/image_raw', throttle_duration_sec=5)
+                return
+            msg = self.latest_camera_msg
+            msg.header.stamp = self.get_clock().now().to_msg()
+            self.publisher_.publish(msg)
                 
     def destroy_node(self):
         if self.cap is not None and self.cap.isOpened():

@@ -31,6 +31,8 @@ pkill -f car &&
 pkill -f all_launcher &&
 pkill -f mpc_planner &&
 pkill -f hunter &&
+pkill -f astra_camera &&
+pkill -f astra_camera_msg &&
 ros2 node list
 
 # omni依赖问题
