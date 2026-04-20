@@ -95,6 +95,153 @@ class KinematicKalmanFilter:
         self.x[3] *= 0.9
 
 
+class ConfidenceAwareSpeedController:
+    """置信度感知速度调节器
+
+    通过分析 N=8 步动作序列的角速度一致性来评估模型预测置信度，
+    在低置信度场景下自动降速以提升安全性。
+
+    置信度判断逻辑：
+    - σ_ω < 0.1 rad/s → 高置信度，保持原速
+    - σ_ω > 0.3 rad/s → 低置信度，降速50%
+    - 连续3帧低置信度 → 紧急制动，降速70%
+    """
+
+    def __init__(self, metric_waypoint_spacing: float = 0.2,
+                 high_conf_threshold: float = 0.1,
+                 low_conf_threshold: float = 0.3,
+                 low_conf_max_count: int = 3):
+        """
+        Args:
+            metric_waypoint_spacing: waypoint间距（米）
+            high_conf_threshold: 高置信度阈值 (rad/s)
+            low_conf_threshold: 低置信度阈值 (rad/s)
+            low_conf_max_count: 触发紧急制动的连续低置信帧数
+        """
+        self.metric_waypoint_spacing = metric_waypoint_spacing
+
+        # 置信度阈值
+        self.high_conf_threshold = high_conf_threshold
+        self.low_conf_threshold = low_conf_threshold
+
+        # 连续低置信度计数
+        self.low_confidence_count = 0
+        self.low_confidence_max_count = low_conf_max_count
+
+        # 历史记录
+        self.history_sigma_omega = []
+        self.history_max_len = 5
+
+    def calculate_waypoint_angular_vel(self, waypoint: list) -> float:
+        """计算单个 waypoint 的角速度
+
+        waypoint 格式: [dx, dy, hx, hy]
+        """
+        dx, dy, hx, hy = waypoint
+        dx_real = dx * self.metric_waypoint_spacing
+        dy_real = dy * self.metric_waypoint_spacing
+
+        # 使用与服务器相同的计算逻辑
+        DT = 1 / 3
+        EPS = 1e-8
+
+        if np.abs(dx_real) < EPS and np.abs(dy_real) < EPS:
+            # 纯转向：根据方向向量计算
+            angle = np.arctan2(hy, hx)
+            while angle > np.pi:
+                angle -= 2 * np.pi
+            while angle < -np.pi:
+                angle += 2 * np.pi
+            return 1.0 * angle / DT
+        elif np.abs(dx_real) < EPS:
+            # 纯横向偏移
+            return 1.0 * np.sign(dy_real) * np.pi / (2 * DT)
+        else:
+            # 有前进分量
+            return np.arctan(dy_real / dx_real) / DT
+
+    def compute_confidence(self, waypoints: list) -> float:
+        """计算角速度序列的标准差作为置信度分数
+
+        Args:
+            waypoints: 8个路径点列表
+
+        Returns:
+            sigma_omega: 角速度标准差 (rad/s)
+        """
+        if len(waypoints) < 2:
+            return 0.0
+
+        angular_vels = [self.calculate_waypoint_angular_vel(wp) for wp in waypoints]
+        sigma_omega = np.std(angular_vels)
+
+        # 记录历史
+        self.history_sigma_omega.append(sigma_omega)
+        if len(self.history_sigma_omega) > self.history_max_len:
+            self.history_sigma_omega.pop(0)
+
+        return sigma_omega
+
+    def adjust_speed(self, linear_vel: float, waypoints: list) -> float:
+        """根据置信度调整线速度
+
+        Args:
+            linear_vel: 原始线速度
+            waypoints: 8个路径点
+
+        Returns:
+            adjusted_vel: 调整后的线速度
+        """
+        # 边界处理
+        if len(waypoints) < 2:
+            return linear_vel
+
+        if linear_vel <= 0:
+            return linear_vel
+
+        sigma_omega = self.compute_confidence(waypoints)
+
+        # 高置信度：保持原速
+        if sigma_omega < self.high_conf_threshold:
+            self.low_confidence_count = 0
+            return linear_vel
+
+        # 低置信度：降速
+        if sigma_omega > self.low_conf_threshold:
+            self.low_confidence_count += 1
+
+            # 连续低置信度触发紧急制动
+            if self.low_confidence_count >= self.low_confidence_max_count:
+                return linear_vel * 0.3  # 降速70%
+
+            return linear_vel * 0.5  # 降速50%
+
+        # 中等置信度：按比例降速
+        scale = min(1.0, self.low_conf_threshold / sigma_omega)
+        return linear_vel * scale
+
+    def get_confidence_info(self, waypoints: list) -> dict:
+        """获取详细置信度信息（用于日志）
+
+        Returns:
+            dict: 包含 sigma_omega, confidence_level, low_conf_count
+        """
+        sigma_omega = self.compute_confidence(waypoints) if len(waypoints) >= 2 else 0.0
+
+        if sigma_omega < self.high_conf_threshold:
+            level = "high"
+        elif sigma_omega > self.low_conf_threshold:
+            level = "low"
+        else:
+            level = "medium"
+
+        return {
+            "sigma_omega": sigma_omega,
+            "confidence_level": level,
+            "low_confidence_count": self.low_confidence_count,
+        }
+
+
 class OmniVLAClientNode(Node):
     """OmniVLA 客户端节点 - 通过 HTTP 调用远程服务器"""
 
@@ -126,6 +273,12 @@ class OmniVLAClientNode(Node):
         self.declare_parameter('max_angular_accel', 0.5)  # rad/s²
         self.declare_parameter('enable_kalman_filter', True)
 
+        # 置信度感知速度调节参数
+        self.declare_parameter('enable_confidence_control', True)
+        self.declare_parameter('high_conf_threshold', 0.1)   # rad/s
+        self.declare_parameter('low_conf_threshold', 0.3)    # rad/s
+        self.declare_parameter('low_conf_max_count', 3)
+
         # 获取参数值
         self.pic_topic = self.get_parameter('pic_topic').get_parameter_value().string_value
         self.process_pic_topic = self.get_parameter('process_pic_topic').get_parameter_value().string_value
@@ -149,6 +302,12 @@ class OmniVLAClientNode(Node):
         self.max_linear_accel = self.get_parameter('max_linear_accel').get_parameter_value().double_value
         self.max_angular_accel = self.get_parameter('max_angular_accel').get_parameter_value().double_value
         self.enable_kalman_filter = self.get_parameter('enable_kalman_filter').get_parameter_value().bool_value
+
+        # 置信度控制参数获取
+        self.enable_confidence_control = self.get_parameter('enable_confidence_control').get_parameter_value().bool_value
+        self.high_conf_threshold = self.get_parameter('high_conf_threshold').get_parameter_value().double_value
+        self.low_conf_threshold = self.get_parameter('low_conf_threshold').get_parameter_value().double_value
+        self.low_conf_max_count = self.get_parameter('low_conf_max_count').get_parameter_value().integer_value
 
         self.get_logger().info(f"服务器地址: {self.server_url}")
         # self.get_logger().info(f"请求超时: {self.request_timeout}s")
@@ -174,6 +333,21 @@ class OmniVLAClientNode(Node):
                 f"卡尔曼滤波器已启用: {self.high_freq_rate}Hz, "
                 f"线加速度限制={self.max_linear_accel}m/s², "
                 f"角加速度限制={self.max_angular_accel}rad/s²"
+            )
+
+        # 置信度感知速度调节器初始化
+        if self.enable_confidence_control:
+            self.confidence_controller = ConfidenceAwareSpeedController(
+                metric_waypoint_spacing=self.metric_waypoint_spacing,
+                high_conf_threshold=self.high_conf_threshold,
+                low_conf_threshold=self.low_conf_threshold,
+                low_conf_max_count=self.low_conf_max_count
+            )
+            self.get_logger().info(
+                f"置信度控制器已启用: "
+                f"高置信阈值={self.high_conf_threshold}rad/s, "
+                f"低置信阈值={self.low_conf_threshold}rad/s, "
+                f"紧急制动帧数={self.low_conf_max_count}"
             )
 
         # 创建发布者和订阅者
@@ -340,9 +514,25 @@ class OmniVLAClientNode(Node):
                 angular_vel = result.get("angular_vel", 0.0)
                 inference_time = result.get("inference_time", 0.0)
 
-                # 【关键改动】将大模型输出作为观测值，触发卡尔曼更新步
+                # 【置信度感知速度调节】
+                adjusted_vel = linear_vel
+                if self.enable_confidence_control and waypoints:
+                    adjusted_vel = self.confidence_controller.adjust_speed(linear_vel, waypoints)
+                    conf_info = self.confidence_controller.get_confidence_info(waypoints)
+
+                    # 输出置信度日志
+                    sigma_omega = conf_info["sigma_omega"]
+                    conf_level = conf_info["confidence_level"]
+                    low_count = conf_info["low_confidence_count"]
+                    self.get_logger().info(
+                        f"置信度: σ_ω={sigma_omega:.3f} rad/s ({conf_level}), "
+                        f"低置信计数={low_count}/{self.low_conf_max_count}, "
+                        f"速度调节: {linear_vel:.3f}→{adjusted_vel:.3f} m/s"
+                    )
+
+                # 【卡尔曼滤波器更新】将调节后速度作为观测值
                 if self.enable_kalman_filter:
-                    z = np.array([linear_vel, angular_vel])
+                    z = np.array([adjusted_vel, angular_vel])
                     self.kf.update(z)
 
                 # 发布路径点
@@ -373,7 +563,7 @@ class OmniVLAClientNode(Node):
                 self.get_logger().info(
                     f"响应 {frame_id}, 总耗时: {duration:.2f}s, 推理: {inference_time:.2f}s, "
                     f"平均: {avg_duration:.2f}s, 成功: {self.success_count}/{self.request_count}\n"
-                    f"线速度: {linear_vel:.3f} m/s, 角速度: {angular_vel:.3f} rad/s"
+                    f"线速度: {adjusted_vel:.3f} m/s (原: {linear_vel:.3f}), 角速度: {angular_vel:.3f} rad/s"
                 )
             else:
                 self.error_count += 1

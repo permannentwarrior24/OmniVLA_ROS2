@@ -212,6 +212,11 @@ def generate_launch_description():
                 'max_linear_accel': 0.3,
                 'max_angular_accel': 0.5,
                 'enable_kalman_filter': True,
+                # 置信度感知速度调节参数
+                'enable_confidence_control': True,
+                'high_conf_threshold': 0.1,  # rad/s
+                'low_conf_threshold': 0.3,   # rad/s
+                'low_conf_max_count': 3,
             }],
             arguments=['--ros-args', '--log-level', log_level],
         )
