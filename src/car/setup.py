@@ -32,6 +32,7 @@ setup(
             "omnivla_node = car.omnivla_vllm_ask_node:main",
             "omnivla_client = car.omnivla_client_node:main",
             "recv_prompt = car.recv_prompt:main",
+            "depth_processor = car.depth_processor_node:main",
         ],
     },
 )

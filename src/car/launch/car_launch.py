@@ -17,6 +17,7 @@ PIC_TOPIC = "/car/pic"
 PROCESS_PIC_TOPIC = "/car/process_pic"
 COMMD_TOPIC = "/goal_point"
 PROMPT_TOPIC = "/car/prompt"
+DEPTH_DESCRIPTION_TOPIC = "/car/depth_description"
 
 class PicModeType(Enum):
     LOCAL = "local"
@@ -117,7 +118,23 @@ def generate_launch_description():
         }],
         arguments=['--ros-args', '--log-level', log_level],
     )
-    
+
+    # 深度处理节点（仅在双目模式下启动）
+    depth_processor = None
+    if MODE == PicModeType.CAMERA_DUAL:
+        depth_processor = Node(
+            package='car',
+            executable='depth_processor',
+            name='depth_processor',
+            parameters=[{
+                'depth_topic': '/camera/depth/image_raw',
+                'output_topic': DEPTH_DESCRIPTION_TOPIC,
+                'obstacle_threshold': 1.5,
+                'publish_rate': 10.0,
+            }],
+            arguments=['--ros-args', '--log-level', log_level],
+        )
+
     if MODEL_TYPE == ModelType.QWEN:
         model_name = 'vllm_ask'
         model_node = Node(
@@ -217,6 +234,9 @@ def generate_launch_description():
                 'high_conf_threshold': 0.1,  # rad/s
                 'low_conf_threshold': 0.3,   # rad/s
                 'low_conf_max_count': 3,
+                # 深度描述注入参数
+                'enable_depth_injection': True,
+                'depth_description_topic': DEPTH_DESCRIPTION_TOPIC,
             }],
             arguments=['--ros-args', '--log-level', log_level],
         )
@@ -229,4 +249,6 @@ def generate_launch_description():
     ld.add_action(model_node)
     ld.add_action(recv_prompt)
     ld.add_action(image_publisher)
+    if depth_processor is not None:
+        ld.add_action(depth_processor)
     return ld

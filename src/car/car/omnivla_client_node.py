@@ -279,6 +279,10 @@ class OmniVLAClientNode(Node):
         self.declare_parameter('low_conf_threshold', 0.3)    # rad/s
         self.declare_parameter('low_conf_max_count', 3)
 
+        # 深度描述注入参数
+        self.declare_parameter('enable_depth_injection', True)
+        self.declare_parameter('depth_description_topic', '/car/depth_description')
+
         # 获取参数值
         self.pic_topic = self.get_parameter('pic_topic').get_parameter_value().string_value
         self.process_pic_topic = self.get_parameter('process_pic_topic').get_parameter_value().string_value
@@ -309,6 +313,10 @@ class OmniVLAClientNode(Node):
         self.low_conf_threshold = self.get_parameter('low_conf_threshold').get_parameter_value().double_value
         self.low_conf_max_count = self.get_parameter('low_conf_max_count').get_parameter_value().integer_value
 
+        # 深度描述参数获取
+        self.enable_depth_injection = self.get_parameter('enable_depth_injection').get_parameter_value().bool_value
+        self.depth_description_topic = self.get_parameter('depth_description_topic').get_parameter_value().string_value
+
         self.get_logger().info(f"服务器地址: {self.server_url}")
         # self.get_logger().info(f"请求超时: {self.request_timeout}s")
 
@@ -316,6 +324,7 @@ class OmniVLAClientNode(Node):
         self.language_prompt = "stop"
         self.active_prompt = False
         self.current_prompt_uuid: Optional[str] = None
+        self.latest_depth_description = ""  # 最新的深度描述
 
         # 性能统计
         self.total_duration = 0.0
@@ -379,6 +388,16 @@ class OmniVLAClientNode(Node):
             self.prompt_callback,
             10
         )
+
+        # 订阅深度描述话题（可选）
+        if self.enable_depth_injection:
+            self.depth_sub = self.create_subscription(
+                String,
+                self.depth_description_topic,
+                self.depth_description_callback,
+                10
+            )
+            self.get_logger().info(f"深度描述注入已启用，订阅: {self.depth_description_topic}")
 
         self.bridge = CvBridge()
 
@@ -450,6 +469,11 @@ class OmniVLAClientNode(Node):
         self.active_prompt = True
         self.get_logger().info(f"新 prompt {uuid}: {text}")
 
+    def depth_description_callback(self, msg: String):
+        """处理接收到的深度描述消息"""
+        self.latest_depth_description = msg.data
+        self.get_logger().debug(f"收到深度描述: {msg.data}")
+
     def high_freq_timer_callback(self):
         """高频定时器回调：执行卡尔曼预测步并发布平滑速度"""
         if not self.enable_kalman_filter:
@@ -504,8 +528,14 @@ class OmniVLAClientNode(Node):
             # 2. 编码为 base64
             image_base64 = self.encode_image_to_base64(cv_image)
 
+            # 2.5 拼接深度描述到 prompt（如果启用且有深度数据）
+            effective_prompt = self.language_prompt
+            if self.enable_depth_injection and self.latest_depth_description:
+                effective_prompt = f"{self.language_prompt}。[环境感知] {self.latest_depth_description}"
+                self.get_logger().debug(f"拼接后 prompt: {effective_prompt}")
+
             # 3. 调用远程服务器
-            result = self.send_inference_request(image_base64, current_uuid)
+            result = self.send_inference_request(image_base64, current_uuid, effective_prompt)
 
             # 4. 处理结果
             if result and result.get("status") == "success":
@@ -592,13 +622,22 @@ class OmniVLAClientNode(Node):
         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
         return f"data:image/jpeg;base64,{jpg_as_text}"
 
-    def send_inference_request(self, image_base64: str, uuid: str) -> Optional[dict]:
-        """发送推理请求到远程服务器"""
+    def send_inference_request(self, image_base64: str, uuid: str, effective_prompt: str = None) -> Optional[dict]:
+        """发送推理请求到远程服务器
+
+        Args:
+            image_base64: 图像的 base64 编码
+            uuid: 请求唯一标识
+            effective_prompt: 有效 prompt（已拼接深度描述），若 None 则使用 self.language_prompt
+        """
         url = f"{self.server_url}/api/inference"
+
+        # 使用传入的 effective_prompt 或默认的 language_prompt
+        prompt_to_send = effective_prompt if effective_prompt is not None else self.language_prompt
 
         payload = {
             "image_base64": image_base64,
-            "prompt": self.language_prompt,
+            "prompt": prompt_to_send,
             "uuid": uuid,
             "goal_lat": self.goal_lat,
             "goal_lon": self.goal_lon,
