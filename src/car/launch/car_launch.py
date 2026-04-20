@@ -207,6 +207,11 @@ def generate_launch_description():
                 'goal_lat': 0.0,
                 'goal_lon': 0.0,
                 'goal_compass': 0.0,
+                # 卡尔曼滤波器参数
+                'high_freq_rate': 20.0,
+                'max_linear_accel': 0.3,
+                'max_angular_accel': 0.5,
+                'enable_kalman_filter': True,
             }],
             arguments=['--ros-args', '--log-level', log_level],
         )

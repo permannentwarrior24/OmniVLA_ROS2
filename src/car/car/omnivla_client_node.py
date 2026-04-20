@@ -18,12 +18,81 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseArray, Pose, Point
+from geometry_msgs.msg import PoseArray, Pose, Point, Twist
 from cv_bridge import CvBridge
 
 import cv2
 import numpy as np
 import requests
+
+
+class KinematicKalmanFilter:
+    """面向大模型高延迟推理的运动学卡尔曼滤波器"""
+
+    def __init__(self, dt_high_freq: float = 0.05):
+        """
+        Args:
+            dt_high_freq: 高频发布周期 (秒)，默认0.05对应20Hz
+        """
+        self.dt = dt_high_freq
+
+        # 状态向量: [v, ω, a_v, a_ω]
+        self.x = np.zeros(4)
+
+        # 状态转移矩阵 (匀加速运动模型)
+        self.F = np.array([
+            [1, 0, self.dt, 0],           # v += a_v * dt
+            [0, 1, 0, self.dt],           # ω += a_ω * dt
+            [0, 0, 1, 0],                 # a_v 保持（后续会被限幅）
+            [0, 0, 0, 1],                 # a_ω 保持
+        ])
+
+        # 观测矩阵: 只观测速度，不观测加速度
+        self.H = np.array([
+            [1, 0, 0, 0],  # 观测 v
+            [0, 1, 0, 0],  # 观测 ω
+        ])
+
+        # 过程噪声协方差 Q (模型不确定性)
+        self.Q = np.diag([0.01, 0.01, 0.1, 0.1])
+
+        # 观测噪声协方差 R (大模型输出噪声)
+        self.R = np.diag([0.05, 0.05])
+
+        # 状态协方差矩阵 P
+        self.P = np.diag([1.0, 1.0, 1.0, 1.0])
+
+    def predict(self) -> np.ndarray:
+        """预测步：高频定时器调用"""
+        # 状态预测
+        self.x = self.F @ self.x
+
+        # 协方差预测
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        return self.x.copy()
+
+    def update(self, z: np.ndarray):
+        """更新步：收到大模型输出时调用
+
+        Args:
+            z: 观测向量 [v_mllm, ω_mllm]
+        """
+        # 卡尔曼增益
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        # 状态更新
+        y = z - self.H @ self.x  # 观测残差
+        self.x = self.x + K @ y
+
+        # 协方差更新
+        I = np.eye(4)
+        self.P = (I - K @ self.H) @ self.P
+
+        # 加速度衰减（若无新观测）
+        self.x[2] *= 0.9
+        self.x[3] *= 0.9
 
 
 class OmniVLAClientNode(Node):
@@ -51,6 +120,12 @@ class OmniVLAClientNode(Node):
         self.declare_parameter('goal_lon', 0.0)
         self.declare_parameter('goal_compass', 0.0)
 
+        # 卡尔曼滤波器参数
+        self.declare_parameter('high_freq_rate', 20.0)  # Hz
+        self.declare_parameter('max_linear_accel', 0.3)  # m/s²
+        self.declare_parameter('max_angular_accel', 0.5)  # rad/s²
+        self.declare_parameter('enable_kalman_filter', True)
+
         # 获取参数值
         self.pic_topic = self.get_parameter('pic_topic').get_parameter_value().string_value
         self.process_pic_topic = self.get_parameter('process_pic_topic').get_parameter_value().string_value
@@ -69,6 +144,12 @@ class OmniVLAClientNode(Node):
         self.goal_lon = self.get_parameter('goal_lon').get_parameter_value().double_value
         self.goal_compass = self.get_parameter('goal_compass').get_parameter_value().double_value
 
+        # 卡尔曼滤波器参数获取
+        self.high_freq_rate = self.get_parameter('high_freq_rate').get_parameter_value().double_value
+        self.max_linear_accel = self.get_parameter('max_linear_accel').get_parameter_value().double_value
+        self.max_angular_accel = self.get_parameter('max_angular_accel').get_parameter_value().double_value
+        self.enable_kalman_filter = self.get_parameter('enable_kalman_filter').get_parameter_value().bool_value
+
         self.get_logger().info(f"服务器地址: {self.server_url}")
         # self.get_logger().info(f"请求超时: {self.request_timeout}s")
 
@@ -83,10 +164,31 @@ class OmniVLAClientNode(Node):
         self.success_count = 0
         self.error_count = 0
 
+        # 卡尔曼滤波器初始化
+        if self.enable_kalman_filter:
+            dt_high_freq = 1.0 / self.high_freq_rate
+            self.kf = KinematicKalmanFilter(dt_high_freq=dt_high_freq)
+            self.v_prev = 0.0
+            self.w_prev = 0.0
+            self.get_logger().info(
+                f"卡尔曼滤波器已启用: {self.high_freq_rate}Hz, "
+                f"线加速度限制={self.max_linear_accel}m/s², "
+                f"角加速度限制={self.max_angular_accel}rad/s²"
+            )
+
         # 创建发布者和订阅者
         self.waypoints_publisher = self.create_publisher(PoseArray, self.commd_topic, 10)
         self.processed_image_publisher = self.create_publisher(Image, self.process_pic_topic, 10)
         self.prompt_complete_pub = self.create_publisher(String, "/car/prompt_complete", 10)
+
+        # cmd_vel 发布者（卡尔曼滤波器高频输出）
+        if self.enable_kalman_filter:
+            self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+            dt_high_freq = 1.0 / self.high_freq_rate
+            self.high_freq_timer = self.create_timer(
+                dt_high_freq,
+                self.high_freq_timer_callback
+            )
 
         # 订阅图像话题
         self.image_subscription = self.create_subscription(
@@ -174,6 +276,39 @@ class OmniVLAClientNode(Node):
         self.active_prompt = True
         self.get_logger().info(f"新 prompt {uuid}: {text}")
 
+    def high_freq_timer_callback(self):
+        """高频定时器回调：执行卡尔曼预测步并发布平滑速度"""
+        if not self.enable_kalman_filter:
+            return
+
+        # 1. 卡尔曼预测步
+        x_predict = self.kf.predict()
+        v_raw = x_predict[0]
+        w_raw = x_predict[1]
+
+        # 2. 严格的运动学限幅（物理底线）
+        dt = 1.0 / self.high_freq_rate
+        v_out = np.clip(
+            v_raw,
+            self.v_prev - self.max_linear_accel * dt,
+            self.v_prev + self.max_linear_accel * dt
+        )
+        w_out = np.clip(
+            w_raw,
+            self.w_prev - self.max_angular_accel * dt,
+            self.w_prev + self.max_angular_accel * dt
+        )
+
+        # 3. 发布给底盘
+        twist_msg = Twist()
+        twist_msg.linear.x = float(v_out)
+        twist_msg.angular.z = float(w_out)
+        self.cmd_vel_publisher.publish(twist_msg)
+
+        # 4. 更新前一时刻状态
+        self.v_prev = v_out
+        self.w_prev = w_out
+
     def image_callback(self, msg):
         """处理接收到的图像消息"""
         # 检查是否有活跃的 prompt
@@ -204,6 +339,11 @@ class OmniVLAClientNode(Node):
                 linear_vel = result.get("linear_vel", 0.0)
                 angular_vel = result.get("angular_vel", 0.0)
                 inference_time = result.get("inference_time", 0.0)
+
+                # 【关键改动】将大模型输出作为观测值，触发卡尔曼更新步
+                if self.enable_kalman_filter:
+                    z = np.array([linear_vel, angular_vel])
+                    self.kf.update(z)
 
                 # 发布路径点
                 if waypoints:
