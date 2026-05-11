@@ -38,6 +38,7 @@ class RecvPromptNode(Node):
         self.declare_parameter("text_topic", "/car/model_text")
         self.declare_parameter("waypoint_topic", "/goal_point")
         self.declare_parameter("prompt_complete_topic", "/car/prompt_complete")  # 新增
+        self.declare_parameter("depth_description_topic", "/car/depth_description")
         self.declare_parameter("prompt_dispatch_mode", "repeat_1hz")
         self.declare_parameter("http_host", "0.0.0.0")
         self.declare_parameter("http_port", 8787)
@@ -49,6 +50,7 @@ class RecvPromptNode(Node):
         self.text_topic = self.get_parameter("text_topic").get_parameter_value().string_value
         self.waypoint_topic = self.get_parameter("waypoint_topic").get_parameter_value().string_value
         self.prompt_complete_topic = self.get_parameter("prompt_complete_topic").get_parameter_value().string_value  # 新增
+        self.depth_description_topic = self.get_parameter("depth_description_topic").get_parameter_value().string_value
         raw_dispatch_mode = (
             self.get_parameter("prompt_dispatch_mode").get_parameter_value().string_value
         )
@@ -73,6 +75,7 @@ class RecvPromptNode(Node):
         self.create_subscription(String, self.text_topic, self.on_text, qos)
         self.create_subscription(PoseArray, self.waypoint_topic, self.on_waypoints, qos)
         self.create_subscription(String, self.prompt_complete_topic, self.on_prompt_complete, qos)
+        self.create_subscription(String, self.depth_description_topic, self.on_depth_description, qos)
 
         self.bridge = CvBridge()
         self._lock = threading.Lock()
@@ -83,6 +86,7 @@ class RecvPromptNode(Node):
         self._latest_raw_frame_id = ""
         self._latest_text = ""
         self._latest_waypoints: List[Dict[str, float]] = []
+        self._latest_depth_description = ""
         self._current_prompt_processing = False
         self._current_prompt_uuid: Optional[str] = None  # 新增：当前处理的 UUID
         self._current_prompt_text: Optional[str] = None
@@ -164,6 +168,7 @@ class RecvPromptNode(Node):
                     "prompt_complete_time": self._last_prompt_complete_time,
                     "pending_prompts_count": len(self._pending_prompts),
                     "prompt_dispatch_mode": self._dispatch_mode,
+                    "depth_description": self._latest_depth_description,
                 }
 
         @app.get("/api/raw_camera")
@@ -302,6 +307,10 @@ class RecvPromptNode(Node):
     def on_text(self, msg: String):
         with self._lock:
             self._latest_text = msg.data
+
+    def on_depth_description(self, msg: String):
+        with self._lock:
+            self._latest_depth_description = msg.data
 
     def on_waypoints(self, msg: PoseArray):
         points = []
