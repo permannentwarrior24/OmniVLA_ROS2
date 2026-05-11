@@ -21,8 +21,8 @@ class DepthProcessorNode(Node):
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
         self.declare_parameter('output_topic', '/car/depth_description')
         self.declare_parameter('obstacle_threshold', 1.5)  # 障碍物距离阈值（米）
-        self.declare_parameter('valid_depth_min', 0.3)     # 有效深度最小值（米）
-        self.declare_parameter('valid_depth_max', 5.0)     # 有效深度最大值（米）
+        self.declare_parameter('valid_depth_min', 0.6)     # 有效深度最小值（米）
+        self.declare_parameter('valid_depth_max', 8.0)     # 有效深度最大值（米）
         self.declare_parameter('publish_rate', 10.0)       # 发布频率（Hz）
 
         # 获取参数
