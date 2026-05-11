@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 OmniVLA 客户端 ROS 节点
-订阅图像话题，调用远程 OmniVLA 服务器 API 进行推理，发布路径点 (PoseArray)
+订阅图像话题，调用远程 OmniVLA 服务器 API 进行推理，获取 8 步动作序列，
+按 3Hz 顺序执行，经卡尔曼滤波后发布 /cmd_vel 速度指令。
 
 此节点用于 Jetson 端，通过网络连接到远程服务器上的 OmniVLA 模型
 """
@@ -18,7 +19,7 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseArray, Pose, Point, Twist
+from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
 import cv2
@@ -326,6 +327,10 @@ class OmniVLAClientNode(Node):
         self.current_prompt_uuid: Optional[str] = None
         self.latest_depth_description = ""  # 最新的深度描述
 
+        # 8 步动作执行队列
+        self.action_queue: list = []  # [(v, w), ...]
+        self.action_execution_timer = None  # 3Hz 定时器，按需创建
+
         # 性能统计
         self.total_duration = 0.0
         self.request_count = 0
@@ -360,7 +365,6 @@ class OmniVLAClientNode(Node):
             )
 
         # 创建发布者和订阅者
-        self.waypoints_publisher = self.create_publisher(PoseArray, self.commd_topic, 10)
         self.processed_image_publisher = self.create_publisher(Image, self.process_pic_topic, 10)
         self.prompt_complete_pub = self.create_publisher(String, "/car/prompt_complete", 10)
 
@@ -455,13 +459,15 @@ class OmniVLAClientNode(Node):
         if not text:
             return
 
-        # 如果当前有活跃的 prompt，发布中断信号
+        # 如果当前有活跃的 prompt，发布中断信号，清空动作队列
         if self.active_prompt and self.current_prompt_uuid:
             interrupt_msg = String()
             interrupt_data = json.dumps({"uuid": self.current_prompt_uuid, "status": "interrupted"})
             interrupt_msg.data = interrupt_data
             self.prompt_complete_pub.publish(interrupt_msg)
             self.get_logger().info(f"prompt {self.current_prompt_uuid} 被打断")
+            self._stop_action_execution()
+            self.action_queue = []
 
         # 更新 prompt 和 UUID
         self.current_prompt_uuid = uuid
@@ -512,10 +518,15 @@ class OmniVLAClientNode(Node):
         self.w_prev = w_out
 
     def image_callback(self, msg):
-        """处理接收到的图像消息"""
+        """处理接收到的图像消息：调用服务器，将 8 步动作存入队列"""
         # 检查是否有活跃的 prompt
         if not self.active_prompt or not self.current_prompt_uuid:
             self.get_logger().debug("没有活跃的 prompt，跳过推理")
+            return
+
+        # 如果上一批动作还没执行完，跳过本次推理
+        if self.action_queue:
+            self.get_logger().debug("上一批动作尚未执行完，跳过本次推理")
             return
 
         current_uuid = self.current_prompt_uuid
@@ -544,46 +555,41 @@ class OmniVLAClientNode(Node):
             # 4. 处理结果
             if result and result.get("status") == "success":
                 waypoints = result.get("waypoints", [])
-                linear_vel = result.get("linear_vel", 0.0)
-                angular_vel = result.get("angular_vel", 0.0)
+                velocities = result.get("velocities", [])  # 8 步 [[v, w], ...]
                 inference_time = result.get("inference_time", 0.0)
 
-                # 【置信度感知速度调节】
-                adjusted_vel = linear_vel
-                if self.enable_confidence_control and waypoints:
-                    adjusted_vel = self.confidence_controller.adjust_speed(linear_vel, waypoints)
-                    conf_info = self.confidence_controller.get_confidence_info(waypoints)
+                if not velocities:
+                    self.get_logger().warn("服务器返回空 velocities，跳过")
+                    return
 
-                    # 输出置信度日志
+                # 【置信度感知速度调节】基于全部 8 步路径点计算置信度，一次性调节
+                adjusted_velocities = velocities
+                if self.enable_confidence_control and waypoints:
+                    # 用第 1 步的线速度作为基准（8 步共享同一调节系数）
+                    base_linear_vel = velocities[0][0] if velocities[0][0] > 0 else 0.0
+                    adjusted_base = self.confidence_controller.adjust_speed(base_linear_vel, waypoints)
+                    scale_factor = adjusted_base / base_linear_vel if base_linear_vel > 0 else 1.0
+
+                    adjusted_velocities = []
+                    for v, w in velocities:
+                        adjusted_velocities.append([v * scale_factor, w])
+
+                    conf_info = self.confidence_controller.get_confidence_info(waypoints)
                     sigma_omega = conf_info["sigma_omega"]
                     conf_level = conf_info["confidence_level"]
                     low_count = conf_info["low_confidence_count"]
                     self.get_logger().info(
                         f"置信度: σ_ω={sigma_omega:.3f} rad/s ({conf_level}), "
                         f"低置信计数={low_count}/{self.low_conf_max_count}, "
-                        f"速度调节: {linear_vel:.3f}→{adjusted_vel:.3f} m/s"
+                        f"速度调节系数: {scale_factor:.3f}"
                     )
 
-                # 【卡尔曼滤波器更新】将调节后速度作为观测值
-                if self.enable_kalman_filter:
-                    z = np.array([adjusted_vel, angular_vel])
-                    self.kf.update(z)
-
-                # 发布路径点
-                if waypoints:
-                    self.publish_waypoints(waypoints)
+                # 将 8 步动作存入执行队列，启动 3Hz 执行定时器
+                self.action_queue = adjusted_velocities
+                self._start_action_execution()
 
                 # 发布处理后的图像
                 self.publish_processed_image(cv_image)
-
-                # 检查 prompt 是否已被中断
-                if current_uuid == self.current_prompt_uuid:
-                    complete_msg = String()
-                    complete_data = json.dumps({"uuid": current_uuid, "status": "completed"})
-                    complete_msg.data = complete_data
-                    self.prompt_complete_pub.publish(complete_msg)
-                    self.active_prompt = False
-                    self.current_prompt_uuid = None
 
                 # 性能统计
                 duration = time.time() - start_time
@@ -593,24 +599,69 @@ class OmniVLAClientNode(Node):
                 avg_duration = self.total_duration / self.request_count
 
                 frame_id = msg.header.frame_id if msg.header.frame_id else "N/A"
-
+                v0, w0 = adjusted_velocities[0]
                 self.get_logger().info(
                     f"响应 {frame_id}, 总耗时: {duration:.2f}s, 推理: {inference_time:.2f}s, "
                     f"平均: {avg_duration:.2f}s, 成功: {self.success_count}/{self.request_count}\n"
-                    f"线速度: {adjusted_vel:.3f} m/s (原: {linear_vel:.3f}), 角速度: {angular_vel:.3f} rad/s"
+                    f"8步动作已入队, 首步: v={v0:.3f} m/s, w={w0:.3f} rad/s"
                 )
             else:
                 self.error_count += 1
                 error_msg = result.get("message", "unknown error") if result else "no response"
                 self.get_logger().error(f"推理失败: {error_msg}")
-                self.active_prompt = False
-                self.current_prompt_uuid = None
+                self._finish_current_prompt()
 
         except Exception as e:
             self.error_count += 1
             self.get_logger().error(f"处理图像出错: {str(e)}")
-            self.active_prompt = False
-            self.current_prompt_uuid = None
+            self._finish_current_prompt()
+
+    def _start_action_execution(self):
+        """启动 3Hz 动作执行定时器"""
+        if self.action_execution_timer is not None:
+            self.action_execution_timer.cancel()
+        self.action_execution_timer = self.create_timer(
+            1.0 / 3.0,  # 3Hz
+            self.action_execution_callback
+        )
+        self.get_logger().info(f"启动 3Hz 动作执行, 队列长度: {len(self.action_queue)}")
+
+    def action_execution_callback(self):
+        """3Hz 定时器回调：从队列取一步动作，执行卡尔曼更新"""
+        if not self.action_queue:
+            # 队列执行完毕
+            self._stop_action_execution()
+            self._finish_current_prompt()
+            return
+
+        # 取队列下一步
+        v, w = self.action_queue.pop(0)
+
+        # 卡尔曼滤波器更新
+        if self.enable_kalman_filter:
+            z = np.array([v, w])
+            self.kf.update(z)
+
+        self.get_logger().debug(
+            f"执行动作: v={v:.3f}, w={w:.3f}, 剩余: {len(self.action_queue)} 步"
+        )
+
+    def _stop_action_execution(self):
+        """停止动作执行定时器"""
+        if self.action_execution_timer is not None:
+            self.action_execution_timer.cancel()
+            self.action_execution_timer = None
+
+    def _finish_current_prompt(self):
+        """标记当前 prompt 完成，清理状态"""
+        if self.current_prompt_uuid:
+            complete_msg = String()
+            complete_data = json.dumps({"uuid": self.current_prompt_uuid, "status": "completed"})
+            complete_msg.data = complete_data
+            self.prompt_complete_pub.publish(complete_msg)
+        self.active_prompt = False
+        self.current_prompt_uuid = None
+        self.action_queue = []
 
     def encode_image_to_base64(self, cv_image) -> str:
         """将图像编码为 base64"""
@@ -685,28 +736,6 @@ class OmniVLAClientNode(Node):
                 time.sleep(self.retry_delay)
 
         return None
-
-    def publish_waypoints(self, waypoints: list):
-        """发布路径点"""
-        pose_array = PoseArray()
-        pose_array.header.stamp = self.get_clock().now().to_msg()
-        pose_array.header.frame_id = "base_link"
-
-        for i, wp in enumerate(waypoints):
-            # waypoints 格式: [dx, dy, hx, hy]
-            if len(wp) >= 2:
-                dx_real = wp[0] * self.metric_waypoint_spacing
-                dy_real = wp[1] * self.metric_waypoint_spacing
-
-                pose = Pose()
-                pose.position.x = float(dx_real)
-                pose.position.y = float(dy_real)
-                pose.position.z = 0.0
-                pose.orientation.w = 1.0
-
-                pose_array.poses.append(pose)
-
-        self.waypoints_publisher.publish(pose_array)
 
     def publish_processed_image(self, cv_image):
         """发布处理后的图像"""

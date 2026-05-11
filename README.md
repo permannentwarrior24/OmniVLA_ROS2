@@ -20,7 +20,7 @@
 │                        云端服务器 (RTX 4080)                       │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │              OmniVLA API Server (端口 8000)                 │  │
-│  │         接收图像+指令 → 返回路径点+速度                        │  │
+│  │    接收图像+指令 → 返回 8 步路径点 + 8 步速度序列              │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                               │ HTTP API
@@ -40,7 +40,7 @@
 │                              │                                  │
 │                              ▼                                  │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │              MPC 控制器 + Hunter 底盘驱动                    │  │
+│  │         PD控制器 + 卡尔曼滤波 + Hunter 底盘驱动              │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -54,7 +54,7 @@ OmniVLA_ROS2/
 │   │   ├── car/
 │   │   │   ├── image_publisher_node.py   # 图像发布节点
 │   │   │   ├── depth_processor_node.py   # 深度图处理节点（创新点一）
-│   │   │   ├── omnivla_client_node.py    # OmniVLA 客户端节点
+│   │   │   ├── omnivla_client_node.py    # OmniVLA 客户端节点（8步顺序执行）
 │   │   │   ├── recv_prompt.py            # Prompt 接收与 HTTP API
 │   │   │   ├── vllm_ask_node.py          # VLM 推理节点（备选）
 │   │   │   └── omnivla_vllm_ask_node.py  # OmniVLA 本地推理节点
@@ -64,7 +64,7 @@ OmniVLA_ROS2/
 │   │   │   ├── test_kalman_filter.py     # 卡尔曼滤波器测试
 │   │   │   └── test_integration_confidence.py  # 置信度控制测试
 │   │   └── setup.py
-│   ├── mpc_planner/                  # MPC 控制器包
+│   ├── mpc_planner/                  # MPC 控制器包（当前未启用）
 │   │   ├── mpc_planner/
 │   │   │   ├── mpc_controller.py         # MPC 控制器
 │   │   │   ├── mpc_core.py               # MPC 核心算法
@@ -133,17 +133,31 @@ OmniVLA_ROS2/
 
 ### 3. OmniVLA 客户端节点 (`omnivla_client_node.py`)
 
-**功能**：订阅图像和 Prompt，调用云端 OmniVLA API，处理返回结果并发布控制指令。
+**功能**：订阅图像和 Prompt，调用云端 OmniVLA API，获取 8 步动作序列，按 3Hz 顺序执行，经卡尔曼滤波后发布 `/cmd_vel`。
+
+**执行流程**：
+```
+图像到达 → 调用服务器 API → 收到 8 步 (v,ω)
+  → 置信度计算（基于 8 步路径点）
+  → 速度调节 → 存入执行队列
+  → 3Hz 定时器逐个执行：卡尔曼更新 + 发布 /cmd_vel
+  → 8 步执行完毕 → 等待下一帧图像
+```
 
 **核心功能**：
 
-#### 3.1 深度描述注入（创新点一）
+#### 3.1 8 步动作顺序执行
+- 模型一次输出 8 步动作（Action Chunk），对应 2.4 秒
+- 按 3Hz（每 0.333s）逐个执行，而非只用 1 步
+- 执行期间新 Prompt 可打断当前执行
+
+#### 3.2 深度描述注入（创新点一）
 ```python
 # 拼接深度描述到 prompt
 effective_prompt = f"{language_prompt}。[环境感知] {latest_depth_description}"
 ```
 
-#### 3.2 运动学卡尔曼滤波器（创新点二）
+#### 3.3 运动学卡尔曼滤波器（创新点二）
 ```python
 class KinematicKalmanFilter:
     """面向大模型高延迟推理的运动学卡尔曼滤波器"""
@@ -154,11 +168,11 @@ class KinematicKalmanFilter:
 ```
 
 **滤波流程**：
-1. 高频定时器（20Hz）执行卡尔曼预测步
-2. 收到模型输出时执行卡尔曼更新步
+1. 高频定时器（20Hz）执行卡尔曼预测步，持续平滑输出
+2. 每步动作执行时（3Hz）执行卡尔曼更新步
 3. 加速度限幅：`|Δv| < a_max * dt`, `|Δω| < ω_max * dt`
 
-#### 3.3 置信度感知速度调节（创新点三）
+#### 3.4 置信度感知速度调节（创新点三）
 ```python
 class ConfidenceAwareSpeedController:
     """通过分析 N=8 步动作序列的角速度一致性来评估模型预测置信度"""
@@ -212,8 +226,7 @@ class ConfidenceAwareSpeedController:
 | `/car/model_text` | `std_msgs/String` | omnivla_client | recv_prompt | 模型输出文本 |
 | `/car/prompt_complete` | `std_msgs/String` | omnivla_client | recv_prompt | Prompt 完成信号 |
 | `/car/model_ready` | `std_msgs/Bool` | omnivla_client | image_publisher | 模型就绪信号 |
-| `/goal_point` | `geometry_msgs/PoseArray` | omnivla_client | mpc_planner | 路径点 |
-| `/cmd_vel` | `geometry_msgs/Twist` | omnivla_client | hunter_base | 速度指令 |
+| `/cmd_vel` | `geometry_msgs/Twist` | omnivla_client | hunter_base | 速度指令（卡尔曼滤波输出） |
 
 ## 环境配置
 
@@ -224,10 +237,7 @@ class ConfidenceAwareSpeedController:
 # 参考：https://docs.ros.org/en/humble/Installation.html
 
 # 安装 Python 依赖
-pip install casadi requests opencv-python
-
-# 安装 ROS2 包
-sudo apt install ros-humble-osqp-vendor
+pip install requests opencv-python
 
 # 克隆 Hunter 驱动
 cd ~/ros2_ws/src
@@ -296,7 +306,6 @@ ros2 run car recv_prompt --ros-args -p http_port:=8787
 ```bash
 pkill -f car
 pkill -f all_launcher
-pkill -f mpc_planner
 pkill -f hunter
 pkill -f astra_camera
 ```

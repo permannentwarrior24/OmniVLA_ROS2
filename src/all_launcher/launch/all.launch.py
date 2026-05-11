@@ -10,11 +10,9 @@ is_sim = False
 
 def generate_launch_description():
     vllm_and_camera_log_level_arg = DeclareLaunchArgument('vllm_and_camera_log_level', default_value='info')
-    mpc_log_level_arg = DeclareLaunchArgument('mpc_log_level', default_value='info')
     hunter_log_level_arg = DeclareLaunchArgument('hunter_log_level', default_value='error')
 
     vllm_and_camera_log_level = LaunchConfiguration('vllm_and_camera_log_level')
-    mpc_log_level = LaunchConfiguration('mpc_log_level')
     hunter_log_level = LaunchConfiguration('hunter_log_level')
 
     vllm_and_camera = IncludeLaunchDescription(
@@ -24,16 +22,8 @@ def generate_launch_description():
         launch_arguments={'log_level': vllm_and_camera_log_level}.items()
     )
 
-    mpc_planner = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('mpc_planner'), 'launch', 'gzaebo.launch.py')
-        ),
-        launch_arguments={
-            'log_level': mpc_log_level,
-            'is_sim': str(is_sim)    
-        }.items()
-    )
-    
+    # MPC planner 已移除：客户端直接通过 PD+卡尔曼滤波控制 /cmd_vel
+
     hunter = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('hunter_base'), 'launch', 'hunter_base.launch.py')
@@ -42,14 +32,12 @@ def generate_launch_description():
     )
 
     ld = LaunchDescription()
-    
+
     ld.add_action(vllm_and_camera_log_level_arg)
-    ld.add_action(mpc_log_level_arg)
     ld.add_action(vllm_and_camera)
-    ld.add_action(mpc_planner)
-    
+
     if not is_sim:
         ld.add_action(hunter_log_level_arg)
         ld.add_action(hunter)
-        
+
     return ld

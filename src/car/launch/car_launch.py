@@ -15,7 +15,6 @@ PIC_DIR = "/home/apollo/disk/ros2/src/car/pic/9"
 # 话题
 PIC_TOPIC = "/car/pic"
 PROCESS_PIC_TOPIC = "/car/process_pic"
-COMMD_TOPIC = "/goal_point"
 PROMPT_TOPIC = "/car/prompt"
 DEPTH_DESCRIPTION_TOPIC = "/car/depth_description"
 
@@ -107,7 +106,6 @@ def generate_launch_description():
             'prompt_topic': PROMPT_TOPIC,
             'image_topic': PROCESS_PIC_TOPIC,
             'text_topic': "/car/model_text",
-            'waypoint_topic': COMMD_TOPIC,
             'http_host': "0.0.0.0",
             'http_port': 8787
         }],
@@ -138,7 +136,6 @@ def generate_launch_description():
                 'prompt_topic': PROMPT_TOPIC,
                 'pic_topic': PIC_TOPIC,
                 'process_pic_topic': PROCESS_PIC_TOPIC,
-                'commd_topic': COMMD_TOPIC,
                 'api_url': API_URL,
                 'compression_quality': COMPRESSION_QUALITY,
                 'img_width': IMG_WIDTH,
@@ -171,7 +168,7 @@ def generate_launch_description():
                 'prompt_topic': PROMPT_TOPIC,
                 'pic_topic': PIC_TOPIC,
                 'process_pic_topic': PROCESS_PIC_TOPIC,
-                'commd_topic': COMMD_TOPIC,
+                'commd_topic': '/goal_point',
                 'api_url': API_URL,
                 'compression_quality': COMPRESSION_QUALITY,
                 'img_width': IMG_HIGHT,
@@ -205,7 +202,6 @@ def generate_launch_description():
                 'prompt_topic': PROMPT_TOPIC,
                 'pic_topic': PIC_TOPIC,
                 'process_pic_topic': PROCESS_PIC_TOPIC,
-                'commd_topic': COMMD_TOPIC,
                 'server_url': SERVER_URL,
                 'request_timeout': 30.0,
                 'compression_quality': COMPRESSION_QUALITY,
